@@ -49,11 +49,18 @@ is_getproperty(ex) = iscall(ex, Base, :getproperty)
 # argument is a literal or not.
 function instrument_getproperty!(ir, v, ex)
   if is_getproperty(ex)
-    if ex.args[3] isa Union{QuoteNode,Integer}
-      ir[v] = xcall(Zygote, :literal_getproperty, ex.args[2], Val(unwrapquote(ex.args[3])))
+    obj, prop = ex.args[2], ex.args[3]
+    if obj isa Module && prop isa QuoteNode && isconst(obj, unwrapquote(prop))
+      # Metaprogramming can generate getproperty(::Module, ...) calls.
+      # Like other types, these are type unstable without constprop.
+      # However, literal_getproperty's heuristic is also not general enough for modules.
+      # Thankfully, we can skip instrumenting these if they're const properties.
+      ex
+    elseif prop isa Union{QuoteNode,Integer}
+      ir[v] = xcall(Zygote, :literal_getproperty, obj, Val(unwrapquote(prop)))
     else
-      f = insert!(ir, v, :(Val($(ex.args[3]))))
-      ir[v] = xcall(Zygote, :literal_getproperty, ex.args[2], f)
+      f = insert!(ir, v, :(Val($(prop))))
+      ir[v] = xcall(Zygote, :literal_getproperty, obj, f)
     end
   else
     ex
@@ -129,14 +136,13 @@ function instrument(ir::IR)
     ex = st.expr
     if isexpr(ex, :foreigncall, :isdefined)
       continue
-    elseif isexpr(ex, :enter, :leave)
-      error("""try/catch is not supported.
-            Refer to the Zygote documentation for fixes.
-            https://fluxml.ai/Zygote.jl/latest/limitations
-            """)
     elseif isexpr(ex, :(=))
       @assert ex.args[1] isa GlobalRef
       pr[v] = xcall(Zygote, :global_set, QuoteNode(ex.args[1]), ex.args[2])
+    elseif isexpr(ex, :boundscheck)
+      # Expr(:boundscheck) now appears in common Julia code paths, so we need to handle it.
+      # For correctness sake, fix to true like https://github.com/dfdx/Umlaut.jl/issues/34.
+      pr[v] = true
     else
       ex = instrument_new!(pr, v, ex)
       ex = instrument_literals!(pr, v, ex)
@@ -181,7 +187,22 @@ ignored_f(f) = f in (GlobalRef(Base, :not_int),
 ignored_f(ir, f) = ignored_f(f)
 ignored_f(ir, f::Variable) = ignored_f(get(ir, f, nothing))
 
-ignored(ir, ex) = isexpr(ex, :call) && ignored_f(ir, ex.args[1])
+function ignored(ir, ex)
+  isexpr(ex, :call) || return false
+  f = ex.args[1]
+  ignored_f(ir, f) && return true
+  if f isa Variable && haskey(ir, f)
+    f = ir[f].expr
+  end
+  if f == GlobalRef(Base, :getproperty) && length(ex.args) >= 3
+    obj, prop = ex.args[2], ex.args[3]
+    # Metaprogramming can generate getproperty(::Module, ...) calls.
+    # These are type unstable without constprop, which transforming to _pullback breaks.
+    # However, we can skip differentiating these if they're const properties.
+    obj isa Module && prop isa QuoteNode && isconst(obj, unwrapquote(prop)) && return true
+  end
+  return false
+end
 ignored(ir, ex::Variable) = ignored(ir, ir[ex])
 
 function primal(ir::IR)
@@ -234,7 +255,6 @@ Variable(a::Alpha) = Variable(a.id)
 sig(b::IRTools.Block) = unique([arg for br in branches(b) for arg in br.args if arg isa Variable])
 sig(pr::Primal) = Dict(b.id => sig(b) for b in blocks(pr.ir))
 
-# TODO unreachables?
 function adjointcfg(pr::Primal)
   ir = empty(pr.ir)
   return!(ir, nothing)
@@ -247,7 +267,9 @@ function adjointcfg(pr::Primal)
         push!(rb, xcall(Base, :(!==), alpha(pr.branches[b.id]), BranchNumber(i)))
       branch!(rb, preds[i].id, unless = cond)
     end
-    if !isempty(branches(b)) && branches(b)[end] == IRTools.unreachable
+    if isempty(preds) || (!isempty(branches(b)) && branches(b)[end] == IRTools.unreachable)
+      # If `b` is unreachable, then no context produced by the primal should end up branching to `rb`
+      push!(rb, xcall(Base, :error, "unreachable")) # `throw` is necessary for inference not to hit the `unreachable`
       branch!(rb, 0)
     end
   end
@@ -268,7 +290,7 @@ xaccum(ir, xs...) = push!(ir, xcall(Zygote, :accum, xs...))
 
 function passthrough_expr(ex::Expr)
     # Metadata we want to preserve
-    isexpr(ex, GlobalRef, :call, :isdefined, :inbounds, :meta, :loopinfo) && return true
+    isexpr(ex, GlobalRef, :call, :isdefined, :inbounds, :meta, :loopinfo, :enter, :leave, :catch) && return true
     # ccalls and more that are safe to preserve/required for proper operation:
     # - jl_set_task_threadpoolid: added in 1.9 for @spawn
     isexpr(ex, :foreigncall) && unwrapquote(ex.args[1]) in (:jl_set_task_threadpoolid,) && return true
@@ -286,9 +308,14 @@ function adjoint(pr::Primal)
     for i = 1:length(sigs[b.id])
       grad(sigs[b.id][i], arguments(rb)[i])
     end
+
+    has_leave = false
+
     # Backprop through statements
     for v in reverse(keys(b))
       ex = b[v].expr
+      has_leave |= isexpr(ex, :leave)
+
       if haskey(pr.pullbacks, v)
         g = push!(rb, stmt(Expr(:call, alpha(pr.pullbacks[v]), grad(v)),
                            line = b[v].line))
@@ -310,6 +337,17 @@ function adjoint(pr::Primal)
         continue
       end
     end
+
+    # This is corresponds to a catch blocks which technically
+    # has predecessors but they are not modelled in the IRTools CFG.
+    # We put an error message at the beginning of said block.
+    if has_leave && isempty(predecessors(b)) && b.id != 1
+        _, f_stmt = first(b)
+        li = pr.ir.lines[f_stmt.line]
+        pushfirst!(rb, stmt(xcall(Base, :error,
+                                  "Can't differentiate function execution in catch block at $(li.file):$(li.line).")))
+    end
+
     if b.id > 1 # Backprop through (predecessor) branch arguments
       gs = grad.(arguments(b))
       for br in branches(rb)

@@ -44,7 +44,6 @@ include("lib/forward.jl")
 include("lib/utils.jl")
 include("lib/range.jl")
 include("lib/logexpfunctions.jl")
-@init @require Distances="b4f34e82-e78d-54a5-968a-f98e89d6e8f7" include("lib/distances.jl")
 
 # we need to define this late, so that the genfuncs see lib.jl
 # Move using statements out of this file to help with sysimage building
@@ -54,12 +53,11 @@ include("compiler/interface2.jl")
 
 include("profiler/Profile.jl")
 
-@init @require Tracker="9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c" begin
-  include("flux.jl")
-end
 
-@init @require Colors="5ae59095-9a9b-59fe-a467-6f913c188581" begin
-  @non_differentiable Colors.ColorTypes._parameter_upper_bound(::Any...)
+if !isdefined(Base, :get_extension)
+  @init @require Distances="b4f34e82-e78d-54a5-968a-f98e89d6e8f7" include("../ext/ZygoteDistancesExt.jl")
+  @init @require Tracker="9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c" include("../ext/ZygoteTrackerExt.jl")
+  @init @require Colors="5ae59095-9a9b-59fe-a467-6f913c188581" include("../ext/ZygoteColorsExt.jl")
 end
 
 using InteractiveUtils
@@ -78,6 +76,13 @@ macro profile(ex)
     _, back = _pullback($(esc(f)), $(esc.(x)...))
     Profile.juno(Profile.profile(back))
   end
+end
+
+using PrecompileTools
+# This caused freezes on early 1.8 patch versions,
+# see https://github.com/SciML/DiffEqFlux.jl/issues/783
+@static if VERSION < v"1.8" || VERSION >= v"1.8.5"
+  @compile_workload precompile()
 end
 
 end # module

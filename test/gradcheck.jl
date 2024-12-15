@@ -174,11 +174,11 @@ end
 
   # Ensure that nothings work with numeric types.
   _, back = Zygote.pullback(getindex, randn(4), [1])
-  @test back([nothing]) == (zeros(4), nothing)
+  @test back([nothing]) === nothing
 
   # Ensure that nothings work with non-numeric types.
   _, back = Zygote.pullback(getindex, [randn(2) for _ in 1:3], [1])
-  @test back([nothing]) == (nothing, nothing)
+  @test back([nothing]) === nothing
 end
 
 @testset "view" begin
@@ -214,6 +214,23 @@ end
   @test gradient(x -> sum(inv, collect(view(x', 1,:))), ones(2,2)) == ([-1 0; -1 0],)
 
   @test gradient(xs -> sum(inv, [x^2 for x in xs]), ones(2)) == ([-2, -2],)
+
+  # adjoint of generators is available and should support generic arrays and iterators
+  # generator of array
+  @test gradient(p -> sum(collect(p*i for i in [1.0, 2.0, 3.0])), 2.0) == (6.0,)
+  # generator of iterator with HasShape
+  @test gradient(p -> sum(collect(p*i for (i,) in zip([1.0, 2.0, 3.0]))), 2.0) == (6.0,)
+  # generator of iterator with HasLength
+  @test gradient(p -> sum(collect(p*i for i in Iterators.take([1.0, 2.0, 3.0], 3))), 2.0) == (6.0,)
+  @test gradient(p -> sum(collect(p*i for i in Iterators.take(p*[1.0, 2.0, 3.0], 2))), 2.0) == (12.0,)
+  # generator 0-d behavior handled incorrectly
+  @test_broken gradient(p -> sum(collect(p*i for i in 1.0)), 2.0)
+  @test_broken gradient(p -> sum(collect(p*i for i in fill(1.0))), 2.0)
+
+  # adjoints for iterators
+  @test gradient(x -> sum(collect(Iterators.take([x*i for i in 1:5], 4))), 1.0) == (10.0,)
+  @test gradient(x -> sum(collect(Iterators.take([x*i for i in 1:5], 5))), 1.0) == (15.0,)
+  @test_broken gradient(sum∘collect, 1.0) == (1.0,) # broken since no generic adjoint
 end
 
 @test gradtest(x -> reverse(x), rand(17))
@@ -275,6 +292,8 @@ end
 @test gradtest(kron, rand(5,1), rand(3,1))
 @test gradtest(kron, rand(5,1), rand(3,1), rand(8,1))
 @test gradtest(kron, rand(5,2), rand(3,2), rand(8,2))
+@test gradtest(kron, rand(5), rand(3, 2))
+@test gradtest(kron, rand(3, 2), rand(5))
 
 for mapfunc in [map,pmap]
   @testset "$mapfunc" begin
@@ -401,19 +420,39 @@ end
   @test gradient((x,y) -> sum(map(*,x,y)), (1,2,3,4,5), [1 2; 3 4]) == ((1,3,2,4,nothing), [1 3; 2 4])
 end
 
+@testset "map: issye 1374" begin
+  # The code to reverse iteration in map was very sloppy, could reverse fwd & not reverse, wtf.
+  # https://github.com/FluxML/Zygote.jl/issues/1374
+  struct Affine1374
+    W
+    b
+  end
+  (m::Affine1374)(x) = [sum(x.*r) for r in eachrow(m.W)] + m.b
+  m = Affine1374(zeros(3,3), zeros(3,1))
+  x = [ 1.0,  2.0,  3.0]
+  y = [-1.0, -2.0, -3.0]
+  l1374(y,ŷ) = sum(abs2.(y - ŷ))/2
+  grads = gradient(m -> l1374(y,m(x)), m)
+  @test grads[1].W ≈ [1 2 3; 2 4 6; 3 6 9]
+end
+
 @testset "sort" begin
   @test gradtest(sort, 5)
   correct = [
       [2,3,1],
       [1, 2, 3],
       [1,2,3],
-      [2,1,3]
+      [2,1,3],
+      [1,3,2],
+      [3,2,1]
   ]
   for i = 1:3
     @test gradient(v->sort(v)[i], [3.,1,2])[1][correct[1][i]] == 1
     @test gradient(v->sort(v)[i], [1.,2,3])[1][correct[2][i]] == 1
     @test gradient(v->sort(v,by=x->x%10)[i], [11,2,99])[1][correct[3][i]] == 1
     @test gradient(v->sort(v,by=x->x%10)[i], [2,11,99])[1][correct[4][i]] == 1
+    @test gradient(v->sort(v,rev=true)[i], [3.,1,2])[1][correct[5][i]] == 1
+    @test gradient(v->sort(v,rev=true)[i], [1.,2,3])[1][correct[6][i]] == 1
   end
 end
 
@@ -501,7 +540,7 @@ end
   @test gradtest(x -> maximum(x, dims=[1, 2]), rand(2, 3, 4))
 
   @test gradient(x -> 1 / maximum(x), [1., 2, 3])[1] == [0, 0, -1/9]
-  
+
   # issue 1224, second order
   f1244(w, x) = sum(maximum((w * x).^2, dims=1))
   g1244(w, x) = sum(gradient(f1244, w, x)[2].^2)
@@ -1516,12 +1555,54 @@ using Zygote: Buffer
     return sum(copy(b))
   end == ([2,2,2],)
 
+  @test gradient([1, 2, 3]) do xs
+    b = Zygote.Buffer(xs)
+    b .= 2
+    return sum(copy(b))
+  end == (nothing,)
+
+  @test gradient(1.1) do p
+    b = Zygote.Buffer(zeros(3))
+    b .= (p*i for i in eachindex(b))
+    return sum(copy(b) .* (2:4))
+  end[1] ≈ 1*2 + 2*3 + 3*4
+
+  @test gradient(1.1) do p
+    b = Zygote.Buffer(zeros(3))
+    copyto!(b, [p*i for i in eachindex(b)])
+    return sum(copy(b) .* (2:4))
+  end[1] ≈ 1*2 + 2*3 + 3*4
+
+  @test gradient(1.1) do p
+    b = Zygote.Buffer(zeros(3))
+    copyto!(b, (p*i for i in eachindex(b)))
+    return sum(copy(b) .* (2:4))
+  end[1] ≈ 1*2 + 2*3 + 3*4
+
+  @test_broken gradient(1.1) do p
+    b = Zygote.Buffer(zeros(3))
+    copyto!(b, p)
+    return sum(copy(b) .* (2:4))
+  end[1] ≈ 1*2
+
   @test gradient(2) do x
     b = Zygote.Buffer([])
     push!(b, x)
     push!(b, 3)
     prod(copy(b))
   end == (3,)
+
+  # backwards pass Buffer widening (#1349)
+  @test Zygote.hessian(1.) do A
+    buf = Zygote.Buffer([0, 0])
+    buf[:] = [1, 2]
+    sum(A^2 .* copy(buf))
+  end == 6
+  @test Zygote.hessian(1.) do A
+    buf = Zygote.Buffer([0, 0])
+    buf[1] = 1
+    A^2 * buf[1]
+  end == 2
 
   # Buffer storing arrays test
   W1 = ones(3, 3)
@@ -1540,6 +1621,14 @@ using Zygote: Buffer
   @test ∇W1 == W1
   @test ∇W2 == W2
   @test ∇x == 6 .* x
+
+  # reduced mwe of #1352
+  @test Zygote.gradient([0,0]) do x
+      buf = Zygote.Buffer(similar(x))
+      buf[:] = x
+      sum(copy(buf[1:2]))
+  end == ([1,1],)
+
 end
 
 @testset "AbstractArray Addition / Subtraction / Negation" begin
@@ -1552,15 +1641,14 @@ end
 
 @testset "AbstractFFTs" begin
 
-  # Many of these tests check a complex gradient to a function with real input. This is now
-  # clamped to real by ProjectTo, but to run the old tests, use here the old gradient function:
-  function oldgradient(f, args...)
-    y, back = Zygote.pullback(f, args...)
-    back(Zygote.sensitivity(y))
-  end
-  # Eventually these rules and tests will be moved to ChainRules.jl, at which point the tests
-  # can be updated to use real / complex consistently.
+  # Eventually these rules and tests will be moved to AbstractFFTs.jl
+  # Rules for direct invocation of [i,r,b]fft have already been defined in
   # https://github.com/JuliaMath/AbstractFFTs.jl/pull/58
+
+  # ChainRules involving AbstractFFTs.Plan are not yet part of AbstractFFTs,
+  # but there is a WIP PR:
+  # https://github.com/JuliaMath/AbstractFFTs.jl/pull/67
+  # After the above is merged, this testset can probably be removed entirely.
 
   findicateMat(i,j,n1,n2) = [(k==i) && (l==j) ? 1.0 : 0.0 for k=1:n1,
                              l=1:n2]
@@ -1574,45 +1662,41 @@ end
       indicateMat = [(k==i) && (l==j) ? 1.0 : 0.0 for k=1:size(X, 1),
                      l=1:size(X,2)]
       # gradient of ifft(fft) must be (approximately) 1 (for various cases)
-      @test oldgradient((X)->real.(ifft(fft(X))[i, j]), X)[1] ≈ indicateMat
+      @test gradient((X)->real.(ifft(fft(X))[i, j]), X)[1] ≈ indicateMat
       # same for the inverse
-      @test oldgradient((X̂)->real.(fft(ifft(X̂))[i, j]), X̂)[1] ≈ indicateMat
+      @test gradient((X̂)->real.(fft(ifft(X̂))[i, j]), X̂)[1] ≈ indicateMat
       # same for rfft(irfft)
-      @test oldgradient((X)->real.(irfft(rfft(X), size(X,1)))[i, j], X)[1] ≈ real.(indicateMat)
-      # rfft isn't actually surjective, so rffft(irfft) can't really be tested this way.
+      @test_broken gradient((X)->real.(irfft(rfft(X), size(X,1)))[i, j], X)[1] ≈ real.(indicateMat)
+      # rfft isn't actually surjective, so rfft(irfft) can't really be tested this way.
 
       # the gradients are actually just evaluating the inverse transform on the
       # indicator matrix
       mirrorI = mirrorIndex(i,sizeX[1])
       FreqIndMat = findicateMat(mirrorI, j, size(X̂r,1), sizeX[2])
-      listOfSols = [(fft, bfft(indicateMat), bfft(indicateMat*im),
-                     plan_fft(X), i, X),
-                    (ifft, 1/N*fft(indicateMat), 1/N*fft(indicateMat*im),
-                     plan_fft(X), i, X),
-                    (bfft, fft(indicateMat), fft(indicateMat*im), nothing, i,
-                     X),
-                    (rfft, real.(brfft(FreqIndMat, sizeX[1])),
-                     real.(brfft(FreqIndMat*im, sizeX[1])), plan_rfft(X),
-                     mirrorI, X),
-                    ((K)->(irfft(K,sizeX[1])), 1/N * rfft(indicateMat),
-                     zeros(size(X̂r)), plan_rfft(X), i, X̂r)]
-      for (trans, solRe, solIm, P, mI, evalX) in listOfSols
-        @test oldgradient((X)->real.(trans(X))[mI, j], evalX)[1] ≈
+      listOfSols = [(X -> fft(X, (1, 2)), real(bfft(indicateMat)), real(bfft(indicateMat*im)),
+                     plan_fft(X), i, X, true),
+                    (K -> ifft(K, (1, 2)), 1/N*real(fft(indicateMat)), 1/N*real(fft(indicateMat*im)),
+                     plan_fft(X), i, X, false),
+                    (X -> bfft(X, (1, 2)), real(fft(indicateMat)), real(fft(indicateMat*im)), nothing, i,
+                     X, false),
+      ]
+      for (trans, solRe, solIm, P, mI, evalX, fft_or_rfft) in listOfSols
+        @test gradient((X)->real.(trans(X))[mI, j], evalX)[1] ≈
           solRe
-        @test oldgradient((X)->imag.(trans(X))[mI, j], evalX)[1] ≈
+        @test gradient((X)->imag.(trans(X))[mI, j], evalX)[1] ≈
           solIm
-        if typeof(P) <:AbstractFFTs.Plan && maximum(trans .== [fft,rfft])
-          @test oldgradient((X)->real.(P * X)[mI, j], evalX)[1] ≈
+        if typeof(P) <:AbstractFFTs.Plan && fft_or_rfft
+          @test gradient((X)->real.(P * X)[mI, j], evalX)[1] ≈
             solRe
-          @test oldgradient((X)->imag.(P * X)[mI, j], evalX)[1] ≈
+          @test gradient((X)->imag.(P * X)[mI, j], evalX)[1] ≈
             solIm
         elseif typeof(P) <: AbstractFFTs.Plan
-          @test oldgradient((X)->real.(P \ X)[mI, j], evalX)[1] ≈
+          @test gradient((X)->real.(P \ X)[mI, j], evalX)[1] ≈
             solRe
           # for whatever reason the rfft_plan doesn't handle this case well,
           # even though irfft does
           if eltype(evalX) <: Real
-            @test oldgradient((X)->imag.(P \ X)[mI, j], evalX)[1] ≈
+            @test gradient((X)->imag.(P \ X)[mI, j], evalX)[1] ≈
               solIm
           end
         end
@@ -1623,51 +1707,48 @@ end
   x = [-0.353213 -0.789656 -0.270151; -0.95719 -1.27933 0.223982]
   # check ffts for individual dimensions
   for trans in (fft, ifft, bfft)
-    @test oldgradient((x)->sum(abs.(trans(x))), x)[1] ≈
-      oldgradient( (x) -> sum(abs.(trans(trans(x,1),2))),  x)[1]
+    @test gradient((x)->sum(abs.(trans(x, (1, 2)))), x)[1] ≈
+      gradient( (x) -> sum(abs.(trans(trans(x,1),2))),  x)[1]
     # switch sum abs order
-    @test oldgradient((x)->abs(sum((trans(x)))),x)[1] ≈
-      oldgradient( (x) -> abs(sum(trans(trans(x,1),2))),  x)[1]
+    @test gradient((x)->abs(sum((trans(x)))),x)[1] ≈
+      gradient( (x) -> abs(sum(trans(trans(x,1),2))),  x)[1]
     # dims parameter for the function
-    @test oldgradient((x, dims)->sum(abs.(trans(x,dims))), x, (1,2))[1] ≈
-      oldgradient( (x) -> sum(abs.(trans(x))), x)[1]
-    # (1,2) should be the same as no index
-    @test oldgradient( (x) -> sum(abs.(trans(x,(1,2)))), x)[1] ≈
-      oldgradient( (x) -> sum(abs.(trans(trans(x,1),2))), x)[1]
-    @test gradcheck(x->sum(abs.(trans(x))), x)
+    @test gradient((x, dims)->sum(abs.(trans(x,dims))), x, (1,2))[1] ≈
+      gradient( (x) -> sum(abs.(trans(x, (1, 2)))), x)[1]
+    @test gradcheck(x->sum(abs.(trans(x, (1, 2)))), x)
     @test gradcheck(x->sum(abs.(trans(x, 2))), x)
   end
 
-  @test oldgradient((x)->sum(abs.(rfft(x))), x)[1] ≈
-    oldgradient( (x) -> sum(abs.(fft(rfft(x,1),2))),  x)[1]
-  @test oldgradient((x, dims)->sum(abs.(rfft(x,dims))), x, (1,2))[1] ≈
-      oldgradient( (x) -> sum(abs.(rfft(x))), x)[1]
+  @test gradient((x)->sum(abs.(rfft(x, (1, 2)))), x)[1] ≈
+    gradient( (x) -> sum(abs.(fft(rfft(x,1),2))),  x)[1]
+  @test gradient((x, dims)->sum(abs.(rfft(x,dims))), x, (1,2))[1] ≈
+      gradient( (x) -> sum(abs.(rfft(x, (1, 2)))), x)[1]
 
   # Test type stability of fft
 
   x = randn(Float64,16)
   P = plan_fft(x)
-  @test typeof(oldgradient(x->sum(abs2,ifft(fft(x))),x)[1]) == Array{Complex{Float64},1}
-  @test typeof(oldgradient(x->sum(abs2,P\(P*x)),x)[1]) == Array{Complex{Float64},1}
-  @test typeof(oldgradient(x->sum(abs2,irfft(rfft(x),16)),x)[1]) == Array{Float64,1}
+  @test typeof(gradient(x->sum(abs2,ifft(fft(x, 1), 1)),x)[1]) == Array{Float64,1}
+  @test typeof(gradient(x->sum(abs2,P\(P*x)),x)[1]) == Array{Float64,1}
+  @test typeof(gradient(x->sum(abs2,irfft(rfft(x, 1),16, 1)),x)[1]) == Array{Float64,1}
 
   x = randn(Float64,16,16)
-  @test typeof(oldgradient(x->sum(abs2,ifft(fft(x,1),1)),x)[1]) == Array{Complex{Float64},2}
-  @test typeof(oldgradient(x->sum(abs2,irfft(rfft(x,1),16,1)),x)[1]) == Array{Float64,2}
+  @test typeof(gradient(x->sum(abs2,ifft(fft(x,1),1)),x)[1]) == Array{Float64,2}
+  @test typeof(gradient(x->sum(abs2,irfft(rfft(x,1),16,1)),x)[1]) == Array{Float64,2}
 
   x = randn(Float32,16)
   P = plan_fft(x)
-  @test typeof(oldgradient(x->sum(abs2,ifft(fft(x))),x)[1]) == Array{Complex{Float32},1}
-  @test typeof(oldgradient(x->sum(abs2,P\(P*x)),x)[1]) == Array{Complex{Float32},1}
-  @test typeof(oldgradient(x->sum(abs2,irfft(rfft(x),16)),x)[1]) == Array{Float32,1}
+  @test typeof(gradient(x->sum(abs2,ifft(fft(x, 1), 1)),x)[1]) == Array{Float32,1}
+  @test typeof(gradient(x->sum(abs2,P\(P*x)),x)[1]) == Array{Float32,1}
+  @test typeof(gradient(x->sum(abs2,irfft(rfft(x, 1),16, 1)),x)[1]) == Array{Float32,1}
 
   x = randn(Float32,16,16)
-  @test typeof(oldgradient(x->sum(abs2,ifft(fft(x,1),1)),x)[1]) == Array{Complex{Float32},2}
-  @test typeof(oldgradient(x->sum(abs2,irfft(rfft(x,1),16,1)),x)[1]) == Array{Float32,2}
+  @test typeof(gradient(x->sum(abs2,ifft(fft(x,1),1)),x)[1]) == Array{Float32,2}
+  @test typeof(gradient(x->sum(abs2,irfft(rfft(x,1),16,1)),x)[1]) == Array{Float32,2}
 end
 
 @testset "FillArrays" begin
-  
+
   @test gradcheck(x->sum(Fill(x[], (2, 2))), [0.1])
   @test first(Zygote.gradient(sz->sum(Ones(sz)), 6)) === nothing
   @test first(Zygote.gradient(sz->sum(Zeros(sz)), 6)) === nothing
@@ -2044,4 +2125,50 @@ end
   g(x) = sum.((f,), x)
   h(x) = sum(abs2, g(x))
   @test gradient(h, x)[1] isa typeof(x)
+end
+
+@testset "Zygote #796" begin
+    function foo(z::Float64)
+        x = 1.0
+        y = 1.0 + z
+        while abs(x - y) > 1e-6
+            y, x = (x + y) / 2, y
+        end
+        return y
+    end
+
+    @test gradcheck(foo ∘ first, [0.0])
+    @test gradcheck(foo ∘ first, [2.0])
+    @test gradcheck(foo ∘ first, [-1e-5])
+    @test gradient(foo, 1024.0)[1] ≈ 2//3
+end
+
+@testset "Zygote #1399" begin
+  function f1(t)  # this works
+    r = 5.0  # (changed to make answers the same)
+    sum(@. exp(-t*r))
+  end
+  @test gradient(f1, [1.0, 0.2])[1] ≈ [-0.03368973499542734, -1.8393972058572117]
+
+  function f2(t)  # this works, too
+    sum(@. exp(-t*5))
+  end
+  @test gradient(f2, [1.0, 0.2])[1] ≈ [-0.03368973499542734, -1.8393972058572117]
+
+  function f3(t)  # but this didn't work
+    r = 1.0
+    sum(@. exp(-t*r*5))
+  end
+  @test gradient(f3, [1.0, 0.2])[1] ≈ [-0.03368973499542734, -1.8393972058572117]
+
+  # Also test 4-arg case
+  function f4(t)
+    r = -0.5
+    sum(@. exp(t*r*5*2))
+  end
+  @test gradient(f4, [1.0, 0.2])[1] ≈ [-0.03368973499542734, -1.8393972058572117]
+
+  # Check that trivial scalar broadcast hasn't gone weird:
+  @test gradient(x -> @.(x * x * x), 2.0) == gradient(x -> x * (x * x), 2.0)
+  @test gradient(x -> @.(3.0*x*2.0*x), 2.0) == gradient(x -> 6(x^2), 2.0)
 end

@@ -1,6 +1,6 @@
 # Zygote
 
-Welcome! Zygote extends the Julia language to support [differentiable programming](https://fluxml.ai/blog/2019/02/07/what-is-differentiable-programming.html). With Zygote you can write down any Julia code you feel like – including using existing Julia packages – then get gradients and optimise your program. Deep learning, ML and probabilistic programming are all different kinds of differentiable programming that you can do with Zygote.
+Welcome! Zygote extends the Julia language to support [differentiable programming](https://fluxml.ai/blogposts/2019-02-07-what-is-differentiable-programming/). With Zygote you can write down any Julia code you feel like – including using existing Julia packages – then get gradients and optimise your program. Deep learning, ML and probabilistic programming are all different kinds of differentiable programming that you can do with Zygote.
 
 At least, that's the idea. We're still in beta so expect some adventures.
 
@@ -131,7 +131,7 @@ julia> gradient(colordiff, RGB(1, 0, 0), RGB(0, 1, 0))
 
 ## Explicit and Implicit Parameters
 
-It's easy to work with even very large and complex models, and there are few ways to do this. Autograd-style models pass around a collection of weights. Depending on how you write your model, there are multiple ways to *explicity* take gradients with respect to parameters. For example, the function `linear` accepts the parameters as an argument to the model. So, we directly pass in the parameters, `θ`, as an argument to the function being differentiated.
+It's easy to work with even very large and complex models, and there are few ways to do this. Autograd-style models pass around a collection of weights. Depending on how you write your model, there are multiple ways to *explicitly* take gradients with respect to parameters. For example, the function `linear` accepts the parameters as an argument to the model. So, we directly pass in the parameters, `θ`, as an argument to the function being differentiated.
 
 ```@docs
 gradient(f, args...)
@@ -171,6 +171,8 @@ julia> (l::Linear)(x) = l.W * x .+ l.b
 
 julia> model = Linear(rand(2, 5), rand(2))
 Linear([0.267663 … 0.334385], [0.0386873, 0.0203294])
+
+julia> x = rand(5);
 
 julia> dmodel = gradient(model -> sum(model(x)), model)[1]
 (W = [0.652543 … 0.683588], b = [1.0, 1.0])

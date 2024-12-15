@@ -1,11 +1,14 @@
-# Limitations
+# Design Limitations
 
-Zygote aims to support differentiating any code you might write in Julia, but it still has a few limitations. Notably, you might encounter errors when trying to differentiate:
-- array mutation
-- `try`/`catch` statements
-- "foreign call" expressions
+Zygote aims to support differentiating any Julia code, but it still has a few limitations.
+Notably, you might encounter errors when trying to differentiate:
+- array mutation,
+- `try`/`catch` statements,
+- "foreign call" expressions.
 
-In this section, we will introduce examples where each of these errors occurs as well as possible work-arounds.
+This section gives examples where each of these errors occurs, as well as possible work-arounds.
+
+Below, it also describes some known bugs in expressions Zygote ought to be able to handle.
 
 ## Array mutation
 
@@ -45,7 +48,7 @@ We got an error message and a long stacktrace. The error informs us that our cod
 
 !!! warning
 
-    Non-mutating functions may also use mutation under the hood. This can be done for performance reasons or code re-use.
+    Non-mutating functions might also use mutation under the hood. This can be done for performance reasons or code re-use.
 
 ```julia
 function g!(x, y)
@@ -79,27 +82,30 @@ julia> gradient(rand(3)) do y
 
 ## Try-catch statements
 
-Any expressions involving `try`/`catch` statements is not supported.
+Code containting try-catch blocks can be differentiated as long as no exception is actually thrown.
+
 ```julia
-function tryme(x)
-  try
-    2 * x
-  catch e
-    throw(e)
-  end
-end
-
-julia> gradient(rand(3)) do x
-         sum(tryme(x))
+julia> function safe_sqrt(x)
+           try
+               sqrt(x)
+           catch
+               0.
+           end
        end
-ERROR: Compiling Tuple{typeof(tryme), Vector{Float64}}: try/catch is not supported.
-Refer to the Zygote documentation for fixes.
-https://fluxml.ai/Zygote.jl/latest/limitations
+safe_sqrt (generic function with 1 method)
 
+julia> gradient(safe_sqrt, 4.)
+(0.25,)
+
+julia> val, pull = pullback(safe_sqrt, -1.)
+(0.0, Zygote.var"#76#77"{Zygote.Pullback{Tuple{typeof(safe_sqrt), Float64}, Any}}(∂(safe_sqrt)))
+
+julia> pull(1.)
+ERROR: Can't differentiate function execution in catch block at #= REPL[2]:3 =#.
 Stacktrace:
-  ...
 ```
-Here `tryme` uses a `try`/`catch` statement, and Zygote throws an error when trying to differentiate it as expected. `try`/`catch` expressions are used for error handling, but they are less common in Julia compared to some other languages.
+
+Here, the `safe_sqrt` function catches DomainError from the sqrt call when the input is out of domain and safely returns 0. Zygote is able to differentiate the function when no error is thrown by the sqrt call, but fails to differentiate when the control flow goes through the catch block.
 
 ## Foreign call expressions
 
@@ -123,7 +129,7 @@ Stacktrace:
 ```
 `jclock` will multiply the result of our C function by an argument. When we try to differentiate with respect to this argument, we get an `foreigncall` error.
 
-## Solutions
+# Solutions
 
 For all of the errors above, the suggested solutions are similar. You have the following possible work arounds available (in order of preference):
 1. avoid the error-inducing operation (e.g. do not use mutating functions)
@@ -148,3 +154,46 @@ julia> gradient(jclock, rand())
 ```
 
 Lastly, if the code causing problems can be fixed, but it is package code instead of your code, then you should open an issue. For functions built into Julia or its standard libraries, you can open an issue with Zygote.jl or ChainRules.jl. For functions in other packages, you can open an issue with the corresponding package issue tracker.
+
+
+# Known Issues
+
+Zygote's issue tracker has the current list of open [bugs](https://github.com/FluxML/Zygote.jl/issues?q=is%3Aissue+is%3Aopen+label%3Abug). There are some general principles about things you may wish to avoid if you can:
+
+## `mutable struct`s
+
+Zygote has limited support for mutation, and in particular will allow you to change a field in some `mutable struct X; a; b; end` by setting `x.a = val`.
+
+However, this has [many limitations](https://github.com/FluxML/Zygote.jl/issues?q=is%3Aissue+is%3Aopen+mutable+struct) and should be avoided if possible.
+
+The simple solution is to use only immutable `struct`s. 
+
+If you need to modify them, using something like `@set` from [Accessors.jl](https://github.com/JuliaObjects/Accessors.jl) should work well. This returns a new object, but does not have side-effects on other copies of it. 
+
+## Re-using variable names
+
+It is common to accumulate values in a loop by re-binding the same variable name to a new value
+many times, for example:
+```
+function mysum(x::Real, n::Int)
+  tot = 0.0
+  for i in 1:n
+    tot += x^n  # binds symbol `tot` to new value
+  end
+  return tot
+end
+```
+However, sometimes such re-binding confuses Zygote, especially if the type of the value changes. Especially if the variable is "boxed", as will happen if you re-bind from within a closure (such as the function created by a `do` block).
+
+## Second derivatives
+
+In principle Zygote supports taking derivatives of derivatives. There are, however, a few problems:
+* Quite a few of its rules are not written in a way that is itself differentiable. For instance they may work by making an array then writing into it, which is mutation of the sort forbidden above. 
+* The complexity of the code grows rapidly, as Zygote differentiates its own un-optimised output.
+* Reverse mode over reverse mode is seldom the best algorithm.
+
+The issue tracker has a label for [second order](https://github.com/FluxML/Zygote.jl/issues?q=is%3Aissue+is%3Aopen+label%3A%22second+order%22), which will outline where the bodies are buried.
+
+Often using a different AD system over Zygote is a better solution.
+This is what [`hessian`](@ref) does, using ForwardDiff over Zygote, but other combinations are possible.
+(Note that rules defined here mean that Zygote over ForwardDiff is translated to ForwardDiff over ForwardDiff.)

@@ -278,11 +278,20 @@ using Zygote: ZygoteRuleConfig
 
     # https://github.com/FluxML/Zygote.jl/issues/1234
     @testset "rrule lookup ambiguities" begin
-      f_ambig(x, y) = x + y
-      ChainRulesCore.rrule(::typeof(f_ambig), x::Int, y) = x + y, _ -> (0, 0)
-      ChainRulesCore.rrule(::typeof(f_ambig), x, y::Int) = x + y, _ -> (0, 0)
+      @testset "unconfigured" begin
+        f_ambig(x, y) = x + y
+        ChainRulesCore.rrule(::typeof(f_ambig), x::Int, y) = x + y, _ -> (0, 0)
+        ChainRulesCore.rrule(::typeof(f_ambig), x, y::Int) = x + y, _ -> (0, 0)
 
-      @test_throws MethodError pullback(f_ambig, 1, 2)
+        @test_throws MethodError pullback(f_ambig, 1, 2)
+      end
+      @testset "configured" begin
+        h_ambig(x, y) = x + y
+        ChainRulesCore.rrule(::ZygoteRuleConfig, ::typeof(h_ambig), x, y) = x + y, _ -> (0, 0)
+        ChainRulesCore.rrule(::RuleConfig, ::typeof(h_ambig), x::Int, y::Int) = x + y, _ -> (0, 0)
+
+        @test_throws MethodError pullback(h_ambig, 1, 2)
+      end
     end
 end
 
@@ -357,8 +366,10 @@ end
         test_rrule(ZygoteRuleConfig(), sum, cbrt, randn(5); rrule_f=rrule_via_ad)
 
         # but x -> cbrt(x) has no rule, so will be done by Zygote
-        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5))
-        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rrule_f=rrule_via_ad)
+        # increased tolerances because these are occasionally flaky at rtol=1e-9
+        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rtol=1e-8)
+        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rtol=1e-8,
+                   rrule_f=rrule_via_ad)
     end
 
     # See https://github.com/FluxML/Zygote.jl/issues/1078
@@ -401,4 +412,23 @@ end
         @test Zygote.z2d((; x=(; re=1)), Ref(3.0+im)) == nested
         @test Zygote.z2d((; x=(; re=nothing)), Ref(3.0+im)) === NoTangent()
     end
+
+    x = (c = (a = randn(3,3), b = rand(3)), d = randn(5))
+    z2d_compiled = Zygote.z2d(x, x)
+    z2d_fallback = Zygote._z2d_struct_fallback(x, x)
+    @test z2d_compiled.d === z2d_fallback.d
+    @test z2d_compiled.c.a === z2d_fallback.c.a
+    @test z2d_compiled.c.b === z2d_fallback.c.b
+end
+
+@testset "ChainRules translation" begin
+    @test Zygote.wrap_chainrules_input(nothing) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input((nothing,)) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input([nothing]) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input(((1.0, 2.0), 3.0)) == Tangent{Any}(Tangent{Any}(1.0, 2.0), 3.0)
+    @test Zygote.wrap_chainrules_input((; a = 1.0, b = 2.0)) == Tangent{Any}(a = 1.0, b = 2.0)
+    @test Zygote.wrap_chainrules_input(Ref(1)) == 1
+    @test Zygote.wrap_chainrules_input([2.0; 4.0]) == [2.0; 4.0]
+    @test Zygote.wrap_chainrules_input([[2.0; 4.0], [1.0; 3.0]]) == [[2.0; 4.0], [1.0; 3.0]]
+    @test Zygote.wrap_chainrules_input([nothing; 4.0]) == [0.0; 4.0] # ChainRules uses the numeric zero where possible
 end

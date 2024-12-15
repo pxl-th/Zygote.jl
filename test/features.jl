@@ -1,5 +1,6 @@
-using Zygote, Test
+using Zygote, Test, LinearAlgebra
 using Zygote: Params, gradient, forwarddiff
+using FillArrays: Fill
 
 @testset "gradient checkpointing" begin
 
@@ -321,7 +322,7 @@ end[1] == 5
 
 @test gradient(x -> one(eltype(x)), rand(10))[1] === nothing
 
-# Thre-way control flow merge
+# Three-way control flow merge
 @test gradient(1) do x
   if x > 0
     x *= 2
@@ -400,7 +401,11 @@ global_param = 3
   y, back = Zygote._pullback(cx, x -> x*global_param, 2)
   @test y == 6
   @test back(1) == (nothing, 3)
-  Zygote.cache(cx)[GlobalRef(Main, :global_param)] == 2
+  ref = first(keys(Zygote.cache(cx)))
+  @test ref isa GlobalRef
+  @test ref.mod == Main
+  @test ref.name == :global_param
+  @test Zygote.cache(cx)[ref] == 2
 end
 
 function pow_try(x)
@@ -411,8 +416,7 @@ function pow_try(x)
   end
 end
 
-@test_broken gradient(pow_try, 1) == (2,)
-@test_throws Zygote.CompileError gradient(pow_try, 1)
+@test gradient(pow_try, 1) == (2,)
 
 function pow_simd(x, n)
   r = 1
@@ -485,7 +489,7 @@ end
   @test gradient(x -> (getindex.(x).^2)[1], Ref.(1:3))[1][1] == (x=2.0,)  # rest are (x = 0.0,), but nothing would be OK too
   @test gradient(x -> (prod.(getindex.(x)))[1], Ref.(eachcol([1 2; 3 4])))[1][1] == (x = [3.0, 1.0],)
 
-  # Broadcasting over Ref is handled specially. Tested elsehwere too.
+  # Broadcasting over Ref is handled specially. Tested elsewhere too.
   @test gradient(x -> sum(sum, x .* [1,2,3]), Ref([4,5])) == ((x = [6.0, 6.0],),)
   @test gradient(x -> sum(sum, Ref(x) .* [1,2,3]), [4,5]) == ([6.0, 6.0],)
 end
@@ -680,6 +684,14 @@ end
   end == ([8 112; 36 2004],)
 end
 
+@testset "PythonCall custom @adjoint" begin
+  using PythonCall: pyimport, pyconvert
+  math = pyimport("math")
+  pysin(x) = math.sin(x)
+  Zygote.@adjoint pysin(x) = pyconvert(Float64, math.sin(x)), δ -> (pyconvert(Float64, δ * math.cos(x)),)
+  @test Zygote.gradient(pysin, 1.5) == Zygote.gradient(sin, 1.5)
+end
+
 # https://github.com/JuliaDiff/ChainRules.jl/issues/257
 @testset "Keyword Argument Passing" begin
   struct Type1{VJP}
@@ -744,6 +756,18 @@ end
   loss(x) = sum(abs2, net(x))
   @test gradient(loss, ones(10,10))[1] == fill(131072, 10, 10)
   @test 150_000_000 > @allocated gradient(loss, ones(1000,1000))
+
+  # https://github.com/FluxML/Zygote.jl/issues/1233
+  function defensiveupdate(d, a)
+    nd = deepcopy(d)
+    nd[1] = d[1] * a
+    return nd
+  end
+  d = Dict(i => ones(1) for i in 1:2)
+  @test gradient(d) do d
+    nd = defensiveupdate(d, 5)
+    return sum(nd[1]) + sum(nd[2])
+  end[1] == Dict(1 => Fill(5, 1), 2 => Fill(1, 1))
 end
 
 @testset "tricky broadcasting" begin
@@ -804,3 +828,54 @@ end
   @test gradient(xs -> sum(map(x->x.im^2, xs)), [1+2im,3])[1] == [4im, 0]
   @test gradient(xs -> mapreduce(x->x.im^2, +, xs), [1+2im,3])[1] == [4im, 0]
 end
+
+@testset "broadcast fallbacks" begin
+  # https://github.com/FluxML/Zygote.jl/issues/1359
+  struct MyFloat64 <: Number
+    n::Float64
+  end
+
+  Base.exp(f::MyFloat64) = MyFloat64(exp(f.n))
+  Base.conj(f::MyFloat64) = MyFloat64(conj(f.n))
+  Base.:*(x::MyFloat64, y::MyFloat64) = MyFloat64(x.n * y.n)
+
+  x = MyFloat64[1., 2., 3.]
+  result, pb = @inferred Zygote.pullback(Base.broadcasted, Base.Broadcast.DefaultArrayStyle{1}(), exp, x)
+  @inferred pb(MyFloat64[1., 1., 1.])
+end
+
+@testset "Dict" begin
+  # issue #717
+  @test gradient(x -> (() -> x[:y])(), Dict(:y => 0.4)) == (Dict(:y => 1.0),)
+
+  ntd = (; data = Dict("x" => rand(2)))
+  @test gradient(x -> sum(x.data["x"]), ntd)[1] == (; data = Dict("x" => ones(2)))
+
+  # issue #760
+  function f760(x)
+    d = Dict()
+    for i in 1:4
+        push!(d, i=>i^x)
+    end
+    sum(values(d))
+  end
+  @test gradient(f760, 3)[1] ≈ 123.93054835019153
+end
+
+@testset "withgradient" begin
+  @test withgradient([1,2,4]) do x
+    z = 1 ./ x
+    sum(z), z
+  end == (val = (1.75, [1.0, 0.5, 0.25]), grad = ([-1.0, -0.25, -0.0625],))
+
+  @test withgradient(3.0, 4.0) do x, y
+    (div = x/y, mul = x*y)
+  end == (val = (div = 0.75, mul = 12.0), grad = (0.25, -0.1875))
+
+  f3(x) = sum(sin, x), sum(cos, x), sum(tan, x)
+  g1 = gradient(first∘f3, [1,2,3.0])
+  y2, g2 = withgradient(first∘f3, [1,2,3.0])
+  y3, g3 = withgradient(f3, [1,2,3.0])
+  @test g1[1] ≈ g2[1] ≈ g3[1]
+end
+

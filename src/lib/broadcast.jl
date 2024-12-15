@@ -30,9 +30,13 @@ using Base.Broadcast: Broadcasted, AbstractArrayStyle, broadcasted, materialize
 # Utilities
 # =========
 
-# ChainRules already marks this non-differentiable,
-# But inference can still give up because of the Zygote -> CR wrapper layer
-@nograd Broadcast.combine_styles
+# ChainRules already marks this non-differentiable,# But inference can still give up because of the Zygote -> CR wrapper layer.
+# This has been desugared from the (deprecated) @nograd macro.
+@inline function Zygote._pullback(::AContext, ::typeof(Broadcast.combine_styles), args...)
+  dargs = ntuple(_ -> nothing, length(args) + 1)
+  combine_styles_pullback(_) = dargs
+  return Broadcast.combine_styles(args...), combine_styles_pullback
+end
 
 accum_sum(xs; dims = :) = reduce(accum, xs, dims = dims)
 
@@ -121,6 +125,9 @@ end
 @adjoint broadcasted(::typeof(imag), x::Numeric) =
   imag.(x), z̄ -> (nothing, im .* real.(z̄))
 
+@adjoint broadcasted(::typeof(abs2), x::Numeric) =
+  abs2.(x), z̄ -> (nothing, 2 .* real.(z̄) .* x)
+
 @adjoint function broadcasted(::typeof(+), a::AbstractArray{<:Number}, b::Bool)
   y = b === false ? a : a .+ b
   y, Δ -> (nothing, Δ, nothing)
@@ -156,6 +163,14 @@ end
 @adjoint broadcasted(::Type{T}, x::Numeric) where {T<:Number} =
   T.(x), ȳ -> (nothing, _project(x, ȳ),)
 
+
+# Fix https://github.com/FluxML/Zygote.jl/issues/1399 by ensuring we avoid a lazier CR rule
+# https://github.com/JuliaDiff/ChainRules.jl/blob/5855c10bdbe691fc07822752f5b5865b9cea44d3/src/rulesets/Base/broadcast.jl#L199
+@adjoint function broadcasted(::typeof(*), x::Numeric, y::Numeric, zs::Numeric...)
+  y, back = _broadcast_generic(__context__, *, x, y, zs...)
+  return y, Base.tail∘back
+end
+
 # General Fallback
 # ================
 
@@ -182,16 +197,19 @@ _dual_purefun(::Type) = false
 _dual_purefun(::Type{typeof(^)}) = false  # avoid DomainError from negative powers
 
 _dual_safearg(x::Numeric{<:Real}) = true
+_dual_safearg(x::Numeric{<:Complex}) = true
 _dual_safearg(x::Ref{<:Numeric{<:Real}}) = true
+_dual_safearg(x::Ref{<:Numeric{<:Complex}}) = true
 _dual_safearg(x::Union{Type,Val,Symbol}) = true  # non-differentiable types
 _dual_safearg(x) = false
 
-@adjoint function broadcasted(::AbstractArrayStyle, f::F, args...) where {F}
+@adjoint broadcasted(::AbstractArrayStyle, f::F, args...) where {F} = _broadcast_generic(__context__, f, args...)
+@inline function _broadcast_generic(__context__, f::F, args...) where {F}
   T = Broadcast.combine_eltypes(f, args)
   # Avoid generic broadcasting in two easy cases:
   if T == Bool
     return (f.(args...), _ -> nothing)
-  elseif T <: Real && isconcretetype(T) && _dual_purefun(F) && all(_dual_safearg, args) && !isderiving()
+  elseif T <: Union{Real, Complex} && isconcretetype(T) && _dual_purefun(F) && all(_dual_safearg, args) && !isderiving()
     return broadcast_forward(f, args...)
   end
   len = inclen(args)
@@ -199,9 +217,8 @@ _dual_safearg(x) = false
   y = broadcast(first, y∂b)
   function ∇broadcasted(ȳ)
     dxs_zip = map(((_, pb), ȳ₁) -> pb(ȳ₁), y∂b, ȳ)
-    dxs = ntuple(len) do i
-      collapse_nothings(map(StaticGetter{i}(), dxs_zip))
-    end
+    getters = ntuple(i -> StaticGetter{i}(), len)
+    dxs = map(g -> collapse_nothings(map(g, dxs_zip)), getters)
     (nothing, accum_sum(dxs[1]), map(unbroadcast, args, Base.tail(dxs))...)
   end
   return y, ∇broadcasted
@@ -231,33 +248,110 @@ end
 # Forward Mode -- necessary for CUDA, also used as a fast path above
 
 import ForwardDiff
-using ForwardDiff: Dual
+using ForwardDiff: Dual, Partials, value, partials
 
-dual(x, p) = x
-dual(x::Real, p) = Dual(x, p)
-dual(x::Bool, p) = x
 
-function dual_function(f::F) where F
-  function (args::Vararg{Any,N}) where N
-    ds = map(args, ntuple(identity,Val(N))) do x, i
-      dual(x, ntuple(j -> i==j, Val(N)))
+# We do this because it ensures type stability so it compiles nicely on the gpu
+# The val is needed for some type stability
+@inline dual(x, i, ::Val{N}) where {N} = x
+@inline dual(x::Bool, i, ::Val{N}) where {N} = x
+@inline dual(x::Real, i, ::Val{N}) where {N} = Dual(x, ntuple(==(i), N))
+# For complex since ForwardDiff.jl doesn't play nicely with complex numbers we
+# construct a Complex dual number and tag the real and imaginary parts separately
+@inline function dual(x::Complex{T}, i, ::Val{N}) where {T,N}
+    re_dual = Dual(real(x), ntuple(==(i), 2N))
+    im_dual = Dual(imag(x), ntuple(==(N+i), 2N))
+    return Complex(re_dual, im_dual)
+end
+
+function dualize(args::Vararg{Any, N}) where {N}
+    ds = map(args, ntuple(identity,N)) do x, i
+        return dual(x, i, Val(N))
+      end
+      return ds
+end
+
+@inline function dual_function(f::F) where F
+    function (args::Vararg{Any,N}) where N
+      ds = dualize(args...)
+      return f(ds...)
     end
-    return f(ds...)
+  end
+
+
+@inline function broadcast_forward(f, args::Vararg{Any,N}) where N
+  out = dual_function(f).(args...)
+  T = eltype(out)
+  T <: Union{Dual, Complex{<:Dual}} || return (out, _ -> nothing)
+  if any(eltype(a) <: Complex for a in args)
+    _broadcast_forward_complex(T, out, args...)
+  else
+    _broadcast_forward(T, out, args...)
   end
 end
 
-@inline function broadcast_forward(f, args::Vararg{Any,N}) where N
+# Real input and real output pullback
+@inline function _broadcast_forward(::Type{<:Dual}, out, args::Vararg{Any, N}) where {N}
   valN = Val(N)
-  out = dual_function(f).(args...)
-  eltype(out) <: Dual || return (out, _ -> nothing)
-  y = broadcast(x -> x.value, out)
+  y = broadcast(x -> value(x), out)
   function bc_fwd_back(ȳ)
     dargs = ntuple(valN) do i
-      unbroadcast(args[i], broadcast((y1, o1) -> y1 * o1.partials[i], ȳ, out))
+      unbroadcast(args[i], broadcast((y1, o1) -> y1 * partials(o1,i), ȳ, out))
     end
     (nothing, nothing, dargs...) # nothings for broadcasted & f
   end
   return y, bc_fwd_back
+end
+
+# This handles the complex output and real input pullback
+@inline function _broadcast_forward(::Type{<:Complex}, out, args::Vararg{Any, N}) where {N}
+    valN = Val(N)
+    y = broadcast(x -> Complex(value(real(x)), value(imag(x))), out)
+    function bc_fwd_back(ȳ)
+      dargs = ntuple(valN) do i
+        unbroadcast(args[i], broadcast((y1, o1) -> (real(y1)*partials(real(o1),i) + imag(y1)*partials(imag(o1), i)), ȳ, out))
+      end
+      (nothing, nothing, dargs...) # nothings for broadcasted & f
+    end
+    return y, bc_fwd_back
+  end
+
+# This handles complex input and real output. We use the gradient definition from ChainRules here
+# since it agrees with what Zygote did for real(x).
+@inline function _broadcast_forward_complex(::Type{<:Dual}, out, args::Vararg{Any, N}) where {N}
+    valN = Val(N)
+    y = broadcast(x -> value(x), out)
+    function bc_fwd_back(ȳ)
+      dargs = ntuple(valN) do i
+        unbroadcast(args[i], broadcast((y1, o1) -> y1 * Complex(partials(o1, i), partials(o1, i+N)), ȳ, out))
+      end
+      (nothing, nothing, dargs...) # nothings for broadcasted & f
+    end
+    return y, bc_fwd_back
+end
+
+# # # This is for complex input and complex output
+# If we assume that
+# f(x + iy) = u(x,y) + iv(x,y)
+# then we do the following for the adjoint
+# Δu ∂u/∂x + Δv∂v/∂x + i(Δu∂u/∂y + Δv ∂v/∂y )
+# this follows https://juliadiff.org/ChainRulesCore.jl/stable/maths/complex.html
+function _adjoint_complex(N, Δz, df, i)
+    Δu, Δv = reim(Δz)
+    du, dv = reim(df)
+    return Complex(Δu*partials(du, i) + Δv*partials(dv, i), Δu*partials(du, i+N) + Δv*partials(dv, i+N))
+end
+
+@inline function _broadcast_forward_complex(::Type{<:Complex}, out, args::Vararg{Any, N}) where {N}
+    valN = Val(N)
+    y = broadcast(x -> Complex(value(real(x)), value(imag(x))), out)
+    function bc_fwd_back(ȳ)
+      dargs = ntuple(valN) do i
+        unbroadcast(args[i], broadcast((y1, o1) -> _adjoint_complex(N, y1, o1, i), ȳ, out))
+      end
+      (nothing, nothing, dargs...) # nothings for broadcasted & f
+    end
+    return y, bc_fwd_back
 end
 
 using GPUArraysCore  # replaces @require CUDA block, weird indenting to preserve git blame
@@ -276,11 +370,18 @@ using GPUArraysCore  # replaces @require CUDA block, weird indenting to preserve
     sum(xs, dims = dims), Δ -> (placeholder .= Δ,)
   end
 
-  # Make sure sum(f, ::CuArray) uses broadcase through forward-mode defined above
+  # Make sure sum(f, ::CuArray) uses broadcast through forward-mode defined above
   # Not the ChainRules.rrule which will use the Zygote.Context and thus not be GPU compatible
-  @adjoint function sum(f, xs::AbstractGPUArray; kws...)
+  function _pullback(cx::AContext, ::typeof(sum), f, xs::AbstractGPUArray)
+    res, back = _pullback(cx, (f, xs) -> sum(f.(xs)), f, xs)
+    return res, back ∘ unthunk_tangent
+  end
+  function _pullback(cx::AContext, ::Core.kwftype(typeof(sum)), kws, ::typeof(sum), f,
+                     xs::AbstractGPUArray)
     @assert !haskey(kws, :init) # TODO add init support (julia 1.6)
-    return pullback((f, xs) -> sum(f.(xs); kws...), __context__, f, xs)
+    res, back = _pullback(cx, (f, xs) -> sum(f.(xs); kws...), f, xs)
+    sum_gpuarray_kw_pullback(Δ) = (nothing, nothing, back(unthunk_tangent(Δ))...)
+    return res, sum_gpuarray_kw_pullback
   end
 
   @adjoint function Base.convert(::Type{T}, xs::Array)  where {T<:AbstractGPUArray}
@@ -288,4 +389,3 @@ using GPUArraysCore  # replaces @require CUDA block, weird indenting to preserve
   end
 
   pull_block_vert(sz, Δ::AbstractGPUArray, A::Number) = @allowscalar Δ[sz]
-

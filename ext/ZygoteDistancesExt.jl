@@ -1,4 +1,16 @@
-using .Distances
+module ZygoteDistancesExt
+
+if isdefined(Base, :get_extension)
+    using Zygote
+    using Distances
+    using LinearAlgebra
+else
+    using ..Zygote
+    using ..Distances
+    using ..LinearAlgebra
+end
+
+using Zygote: @adjoint, AContext, _pullback
 
 @adjoint function (::SqEuclidean)(x::AbstractVector, y::AbstractVector)
   δ = x .- y
@@ -66,22 +78,34 @@ end
 
 _sqrt_if_positive(d, δ) = d > δ ? sqrt(d) : zero(d)
 
-@adjoint function pairwise(dist::Euclidean, X::AbstractMatrix, Y::AbstractMatrix; dims=2)
+function Zygote._pullback(cx::AContext, ::Core.kwftype(typeof(pairwise)),
+                   kws::@NamedTuple{dims::Int}, ::typeof(pairwise), dist::Euclidean,
+                   X::AbstractMatrix, Y::AbstractMatrix)
   # Modify the forwards-pass slightly to ensure stability on the reverse.
+  dims = kws.dims
   function _pairwise_euclidean(sqdist::SqEuclidean, X, Y)
     D2 = pairwise(sqdist, X, Y; dims=dims)
     δ = eps(eltype(D2))
     return _sqrt_if_positive.(D2, δ)
   end
-  return pullback(_pairwise_euclidean, SqEuclidean(dist.thresh), X, Y)
+  res, back = _pullback(cx, _pairwise_euclidean, SqEuclidean(dist.thresh), X, Y)
+  pairwise_Euclidean_pullback(Δ) = (nothing, nothing, back(Zygote.unthunk_tangent(Δ))...)
+  return res, pairwise_Euclidean_pullback
 end
 
-@adjoint function pairwise(dist::Euclidean, X::AbstractMatrix; dims=2)
+function Zygote._pullback(cx::AContext, ::Core.kwftype(typeof(pairwise)),
+                   kws::@NamedTuple{dims::Int}, ::typeof(pairwise), dist::Euclidean,
+                   X::AbstractMatrix)
   # Modify the forwards-pass slightly to ensure stability on the reverse.
+  dims = kws.dims
   function _pairwise_euclidean(sqdist::SqEuclidean, X)
     D2 = pairwise(sqdist, X; dims=dims)
     δ = eps(eltype(D2))
     return _sqrt_if_positive.(D2, δ)
   end
-  return pullback(_pairwise_euclidean, SqEuclidean(dist.thresh), X)
+  res, back = _pullback(cx, _pairwise_euclidean, SqEuclidean(dist.thresh), X)
+  pairwise_Euclidean_pullback(Δ) = (nothing, nothing, back(Zygote.unthunk_tangent(Δ))...)
+  return res, pairwise_Euclidean_pullback
+end
+
 end

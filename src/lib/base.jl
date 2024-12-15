@@ -17,6 +17,19 @@ end
   end
 end
 
+# IdSet (needed for nested AD with implicit params)
+
+grad_mut(::IdSet) = IdSet()
+
+function _pullback(cx::AContext, ::typeof(push!), s::IdSet, @nospecialize(x))
+  res = push!(s, x)
+  function idset_push!_pullback(_)
+    Δ = pop!(grad_mut(cx, s), x, nothing)
+    (nothing, Δ, nothing)
+  end
+  return res, idset_push!_pullback
+end
+
 # Dictionaries
 
 grad_mut(d::AbstractDict) = Dict()
@@ -24,8 +37,8 @@ grad_mut(d::IdDict) = IdDict()
 
 # TODO perhaps look up mutable gradients in `pullback`
 function accum(a::AbstractDict, b::AbstractDict)
-  @assert a === b
-  return a
+  a === b && return a # Mutating case
+  return merge(a, b)
 end
 
 @adjoint function getindex(d::AbstractDict, k)
@@ -178,10 +191,9 @@ end
 # For merge between NamedTuple and Dict, we will just convert the Dict to a NamedTuple.
 # and then call `pullback`, which should overall be pretty efficient code generated,
 # and it avoids trying to AD the problematic generic `merge(::NamedTuple, ::iter)` method which uses `push!`.
-if VERSION >= v"1.6"
-  @adjoint merge(nt::NamedTuple, dict::Dict) = pullback(merge, nt, NamedTuple(dict))
-else
-  @adjoint merge(nt::NamedTuple, dict::Dict) = pullback(merge, nt, (;dict...))
+function _pullback(cx::AContext, ::typeof(merge), a::NamedTuple, b::Dict{Symbol})
+  res, back = _pullback(cx, merge, a, NamedTuple(b))
+  return res, back ∘ unthunk_tangent
 end
 
 # Keyword arguments pretend to be a Dict, but are secretly wrapping a NamedTuple.

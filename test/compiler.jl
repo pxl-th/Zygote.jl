@@ -17,8 +17,10 @@ trace_contains(st, func, file, line) = any(st) do fr
 end
 
 bad(x) = x
+const bad_def_line = (@__LINE__) + 1
 @adjoint bad(x) = x, Δ -> error("bad")
 
+const bad_call_line = (@__LINE__) + 3
 function badly(x)
   x = x + 1
   x = bad(x)
@@ -30,11 +32,11 @@ y, back = pullback(badly, 2)
 @test_throws Exception back(1)
 bt = try back(1) catch e stacktrace(catch_backtrace()) end
 
-@test trace_contains(bt, nothing, "compiler.jl", 20)
-if VERSION >= v"1.6-"
-  @test_broken trace_contains(bt, :badly, "compiler.jl", 24)
+@test trace_contains(bt, nothing, "compiler.jl", bad_def_line)
+if VERSION <= v"1.6-" || VERSION >= v"1.10-"
+  @test trace_contains(bt, :badly, "compiler.jl", bad_call_line)
 else
-  @test trace_contains(bt, :badly, "compiler.jl", 24)
+  @test_broken trace_contains(bt, :badly, "compiler.jl", bad_call_line)
 end
 
 # Type inference checks
@@ -81,10 +83,14 @@ y, back = @test_inferred pullback(((a,b),) -> a, (5, 10))
 
 # testcase for issue #808
 # testing that methods(Base.show) does not throw. Having something more specific would be too fragile
-buf = IOBuffer()
-Base.show(buf, methods(Base.show))
-str_repr = String(take!(buf))
-@test !isempty(str_repr)
+show_err = try
+  buf = IOBuffer()
+  Base.show(buf, methods(Base.show))
+  nothing
+catch ex
+  ex
+end
+@test show_err === nothing
 
 struct Funky
     x
@@ -128,7 +134,7 @@ end
   d_two = Zygote.pullback(two_svds, X)[2](Δoutput)
   d_one = Zygote.pullback(one_svd, X)[2](Δoutput)
   @test d_one == d_two
-end 
+end
 
 # this test fails if adjoint for literal_getproperty is added
 # https://github.com/FluxML/Zygote.jl/issues/922#issuecomment-804128905
@@ -156,6 +162,13 @@ function _Gaussian(suffix::Symbol)
         $name
     end
 end
+
+module MyMod
+  const C = 1
+  func(a, b) = a * b
+end
+
+@eval usesmod(x) = Base.getproperty($MyMod, :func)(x, Base.getproperty($MyMod, :C))
 
 @testset "inference for `getproperty`" begin
     Gaussian = _Gaussian(:getproperty)
@@ -204,7 +217,137 @@ end
     y, back = @inferred pullback(x -> x.m, g)
     @test y == getfield(g, :m)
     @test @inferred(back(1.0)) == ((m = 1.0, P = nothing),)
+
+
+    # Const properties on modules should be lowered as-is (not differentiated)
+    @test @inferred gradient(usesmod, 1)[1] == 1.0
 end
 
 # issue 897
 @test gradient(x -> sum(norm, collect(eachcol(x))), ones(3, 400))[1] ≈ fill(0.5773502691896258, 3, 400)
+
+# Tests adapted from https://github.com/dfdx/Umlaut.jl/pull/35
+@eval _has_boundscheck(x) = ifelse($(Expr(:boundscheck)), 2x, x)
+
+@testset "Meta Expr handling" begin
+  y, (dx,) = withgradient(_has_boundscheck, 1)
+  @test y == 2
+  @test dx == 2
+end
+
+# issue 1118 & 1380
+function f_1380(x)
+    if rand(Bool)
+        return x
+    else
+        return 2x
+    end
+
+    # unreachable
+    return nothing
+end
+
+@testset "unreachable block" begin
+    y, back = Zygote.pullback(f_1380, 1.)
+    # There should not be a compiler error
+    local g
+    @test_nowarn g = back(1.)
+    @test only(g) ∈ (1., 2.)
+end
+
+function throws_and_catches_if_x_negative(x,y)
+    z = x + y
+    try
+        if x < 0.
+            throw(DomainError("x is negative"))
+        end
+        z = 2z + x + y
+    catch err
+        @error "something went wrong" exception=(err,catch_backtrace())
+    end
+    return 3z
+end
+
+function try_catch_finally(cond, x)
+
+    try
+        x = 2x
+        cond && throw(DomainError())
+    catch
+        x = 2x
+    finally
+        x = 3x
+    end
+
+    x
+end
+
+if VERSION >= v"1.8"
+    # try/catch/else is invalid syntax prior to v1.8
+    eval(Meta.parse("""
+        function try_catch_else(cond, x)
+            x = 2x
+
+            try
+                x = 2x
+                cond && throw(nothing)
+            catch
+                x = 3x
+            else
+                x = 2x
+            end
+
+            x
+        end
+    """))
+end
+
+@testset "try/catch" begin
+    @testset "happy path (nothrow)" begin
+        res, (dx,dy) = withgradient(throws_and_catches_if_x_negative, 1., 2.)
+        @test res == 3 * (2 * (1. + 2.) + 1. + 2.)
+        @test dx == 3. * (2. + 1.)
+        @test dy == 3. * (2. + 1.)
+    end
+
+    @testset "try/catch/finally" begin
+        res, (_, dx,) = withgradient(try_catch_finally, false, 1.)
+        @test res == 6.
+        @test dx == 6.
+
+        res, pull = pullback(try_catch_finally, true, 1.)
+        @test res == 12.
+        @test_throws ErrorException pull(1.)
+        err = try pull(1.) catch ex; ex end
+        @test occursin("Can't differentiate function execution in catch block",
+                       string(err))
+    end
+
+    if VERSION >= v"1.8"
+        @testset "try/catch/else" begin
+            @test Zygote.gradient(try_catch_else, false, 1.0) == (nothing, 8.0)
+            @test_throws "Can't differentiate function execution in catch block" Zygote.gradient(try_catch_else, true, 1.0)
+        end
+    end
+
+    function foo_try(f)
+      y = 1
+      try
+        y = f()
+      catch
+        y
+      end
+      y
+    end
+
+    g, = gradient(x -> foo_try(() -> x), 1) # 1
+    @test g == 1.
+
+    vy, pull = pullback(foo_try, () -> 0//0) # bypass because of expr
+    @test vy === 1
+    @test_throws ErrorException pull(1.)
+
+    err = try pull(1.) catch ex; ex end
+    @test occursin("Can't differentiate function execution in catch block",
+                   string(err))
+end
